@@ -1,11 +1,11 @@
-name: Sync Stooq CSV (to €/g) — robust
+name: "Sync Stooq CSV to EUR/g"
 
 permissions:
   contents: write
 
 on:
   schedule:
-    - cron: "10 * * * *"    # ogni ora al minuto 10 (UTC)
+    - cron: "10 * * * *"   # ogni ora al minuto 10 (UTC)
   workflow_dispatch:
 
 jobs:
@@ -13,11 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
-  uses: actions/checkout@v4
-  with:
-    persist-credentials: true
-    fetch-depth: 0
-
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
 
       - name: Warm-up cookie su stooq.com
         run: |
@@ -30,8 +29,8 @@ jobs:
           set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
           curl -fL --retry 5 --retry-delay 2 --retry-connrefused --compressed \
-               -A "$UA" -b cookies.txt -c cookies.txt \
-               "https://stooq.com/q/d/l/?s=xaueur&i=d" -o raw_gold.csv
+            -A "$UA" -b cookies.txt -c cookies.txt \
+            "https://stooq.com/q/d/l/?s=xaueur&i=d" -o raw_gold.csv
           test -s raw_gold.csv
           head -n 2 raw_gold.csv || true
 
@@ -40,12 +39,12 @@ jobs:
           set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
           curl -fL --retry 5 --retry-delay 2 --retry-connrefused --compressed \
-               -A "$UA" -b cookies.txt -c cookies.txt \
-               "https://stooq.com/q/d/l/?s=xageur&i=d" -o raw_silver.csv
+            -A "$UA" -b cookies.txt -c cookies.txt \
+            "https://stooq.com/q/d/l/?s=xageur&i=d" -o raw_silver.csv
           test -s raw_silver.csv
           head -n 2 raw_silver.csv || true
 
-      - name: Converti €/oz → €/g (senza KeyError, header agnostico)
+      - name: Converti €/oz in €/g e normalizza
         run: |
           python - <<'PY'
           import csv, unicodedata
@@ -54,51 +53,44 @@ jobs:
           OZ_TO_G = Decimal('31.1035')
 
           def norm(s:str)->str:
-              # lower + rimozione accenti per intercettare 'zamkniecie' ecc.
               s = s.strip().lower()
               s = unicodedata.normalize('NFKD', s)
               return ''.join(ch for ch in s if not unicodedata.combining(ch))
 
           def convert(src, dst):
-              # leggi con BOM-safe e auto-delimiter
               with open(src, 'r', encoding='utf-8-sig', newline='') as f:
-                  sample = f.read(2048)
-                  f.seek(0)
+                  sample = f.read(2048); f.seek(0)
                   try:
                       dialect = csv.Sniffer().sniff(sample, delimiters=',;')
                   except Exception:
                       dialect = csv.excel
                   reader = csv.reader(f, dialect)
                   rows = [r for r in reader if any(cell.strip() for cell in r)]
-
               if not rows:
                   raise SystemExit(f"Nessun dato in {src}")
 
               header = [h.lstrip('\ufeff') for h in rows[0]]
               data_rows = rows[1:]
-
-              # individua indici 'date|data' e 'close|zamkniecie|c|last|price'
               lower = [norm(h) for h in header]
+
               date_idx = None
               for cand in ('date','data'):
                   if cand in lower:
                       date_idx = lower.index(cand); break
-              if date_idx is None: date_idx = 0  # fallback
+              if date_idx is None: date_idx = 0
 
               close_idx = None
-              for cand in ('close','zamkniecie','zamkniecie','c','last','price','zamkniecia'):
+              for cand in ('close','zamkniecie','c','last','price'):
                   if cand in lower:
                       close_idx = lower.index(cand); break
-              if close_idx is None: close_idx = len(header)-1  # fallback
+              if close_idx is None: close_idx = len(header)-1
 
               out=[]
               for row in data_rows:
-                  if len(row) <= max(date_idx, close_idx): 
-                      continue
+                  if len(row) <= max(date_idx, close_idx): continue
                   d = row[date_idx].strip()
                   raw = row[close_idx].strip().replace(',', '.')
-                  if not d or not raw:
-                      continue
+                  if not d or not raw: continue
                   try:
                       v = Decimal(raw)
                   except Exception:
@@ -106,7 +98,6 @@ jobs:
                   eur_per_g = (v / OZ_TO_G).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
                   out.append((d, str(eur_per_g)))
 
-              # ordina per data ISO se possibile (Stooq usa YYYY-MM-DD)
               out.sort(key=lambda x: x[0])
 
               with open(dst, 'w', newline='') as f2:
@@ -120,9 +111,9 @@ jobs:
 
       - name: Mostra ultime righe (debug)
         run: |
-          echo '--- gold_history.csv (tail) ---'
+          echo '--- gold_history.csv ---'
           tail -n 5 gold_history.csv || true
-          echo '--- silver_history.csv (tail) ---'
+          echo '--- silver_history.csv ---'
           tail -n 5 silver_history.csv || true
 
       - name: Commit & push se ci sono cambiamenti
@@ -130,4 +121,9 @@ jobs:
           git config user.name  "csv-bot"
           git config user.email "csv-bot@users.noreply.github.com"
           git add gold_history.csv silver_history.csv || true
-          git diff --cached --quiet && echo "Nessun cambiamento" || (git commit -m "Auto update CSV $(date -u +%F' '%T'Z')" && git push)
+          if git diff --cached --quiet; then
+            echo "Nessun cambiamento"
+          else
+            git commit -m "Auto update CSV $(date -u +%F' '%T'Z')"
+            git push
+          fi
