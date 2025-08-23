@@ -1,9 +1,9 @@
-name: Sync Stooq CSV (to €/g)
+name: Sync Stooq CSV (to €/g) — robust
 
 on:
   schedule:
-    - cron: "10 * * * *"   # ogni ora al minuto 10 (UTC). Cambia se vuoi.
-  workflow_dispatch:        # avvio manuale dal tab Actions
+    - cron: "10 * * * *"    # ogni ora al minuto 10 (UTC)
+  workflow_dispatch:
 
 jobs:
   update:
@@ -14,65 +14,109 @@ jobs:
 
       - name: Warm-up cookie su stooq.com
         run: |
+          set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
           curl -fsSL -A "$UA" -c cookies.txt https://stooq.com/ -o /dev/null
 
-      - name: Scarica GOLD XAU/EUR (daily)
+      - name: Scarica GOLD XAU/EUR (daily) con retry
         run: |
+          set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
-          curl -fsSL -A "$UA" -b cookies.txt -c cookies.txt "https://stooq.com/q/d/l/?s=xaueur&i=d" -o raw_gold.csv
+          curl -fL --retry 5 --retry-delay 2 --retry-connrefused --compressed \
+               -A "$UA" -b cookies.txt -c cookies.txt \
+               "https://stooq.com/q/d/l/?s=xaueur&i=d" -o raw_gold.csv
           test -s raw_gold.csv
+          head -n 2 raw_gold.csv || true
 
-      - name: Scarica SILVER XAG/EUR (daily)
+      - name: Scarica SILVER XAG/EUR (daily) con retry
         run: |
+          set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
-          curl -fsSL -A "$UA" -b cookies.txt -c cookies.txt "https://stooq.com/q/d/l/?s=xageur&i=d" -o raw_silver.csv
+          curl -fL --retry 5 --retry-delay 2 --retry-connrefused --compressed \
+               -A "$UA" -b cookies.txt -c cookies.txt \
+               "https://stooq.com/q/d/l/?s=xageur&i=d" -o raw_silver.csv
           test -s raw_silver.csv
+          head -n 2 raw_silver.csv || true
 
-      - name: Converti da €/oz a €/g e mantieni solo date,eur_per_g
+      - name: Converti €/oz → €/g (senza KeyError, header agnostico)
         run: |
           python - <<'PY'
-          import csv, sys
+          import csv, unicodedata
           from decimal import Decimal, ROUND_HALF_UP
 
           OZ_TO_G = Decimal('31.1035')
 
-          def convert(src, dst):
-              with open(src, newline='') as f:
-                  r = csv.DictReader(f)
-                  cols_lower = [c.lower() for c in r.fieldnames]
-                  # Trova colonne 'date' e 'close' (fallback all'ultima)
-                  date_field = ('date' if 'date' in cols_lower else r.fieldnames[0])
-                  if date_field != 'date':
-                      date_field = r.fieldnames[cols_lower.index('date')] if 'date' in cols_lower else r.fieldnames[0]
-                  price_field = None
-                  for cand in ('close','c','last','price'):
-                      if cand in cols_lower:
-                          price_field = r.fieldnames[cols_lower.index(cand)]
-                          break
-                  if price_field is None:
-                      price_field = r.fieldnames[-1]
+          def norm(s:str)->str:
+              # lower + rimozione accenti per intercettare 'zamkniecie' ecc.
+              s = s.strip().lower()
+              s = unicodedata.normalize('NFKD', s)
+              return ''.join(ch for ch in s if not unicodedata.combining(ch))
 
-                  rows=[]
-                  for row in r:
-                      d = row[date_field].strip()
-                      if not d: 
-                          continue
-                      raw = row[price_field].strip().replace(',','.')
-                      if not raw:
-                          continue
+          def convert(src, dst):
+              # leggi con BOM-safe e auto-delimiter
+              with open(src, 'r', encoding='utf-8-sig', newline='') as f:
+                  sample = f.read(2048)
+                  f.seek(0)
+                  try:
+                      dialect = csv.Sniffer().sniff(sample, delimiters=',;')
+                  except Exception:
+                      dialect = csv.excel
+                  reader = csv.reader(f, dialect)
+                  rows = [r for r in reader if any(cell.strip() for cell in r)]
+
+              if not rows:
+                  raise SystemExit(f"Nessun dato in {src}")
+
+              header = [h.lstrip('\ufeff') for h in rows[0]]
+              data_rows = rows[1:]
+
+              # individua indici 'date|data' e 'close|zamkniecie|c|last|price'
+              lower = [norm(h) for h in header]
+              date_idx = None
+              for cand in ('date','data'):
+                  if cand in lower:
+                      date_idx = lower.index(cand); break
+              if date_idx is None: date_idx = 0  # fallback
+
+              close_idx = None
+              for cand in ('close','zamkniecie','zamkniecie','c','last','price','zamkniecia'):
+                  if cand in lower:
+                      close_idx = lower.index(cand); break
+              if close_idx is None: close_idx = len(header)-1  # fallback
+
+              out=[]
+              for row in data_rows:
+                  if len(row) <= max(date_idx, close_idx): 
+                      continue
+                  d = row[date_idx].strip()
+                  raw = row[close_idx].strip().replace(',', '.')
+                  if not d or not raw:
+                      continue
+                  try:
                       v = Decimal(raw)
-                      eur_per_g = (v / OZ_TO_G).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
-                      rows.append((d, eur_per_g))
+                  except Exception:
+                      continue
+                  eur_per_g = (v / OZ_TO_G).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
+                  out.append((d, str(eur_per_g)))
+
+              # ordina per data ISO se possibile (Stooq usa YYYY-MM-DD)
+              out.sort(key=lambda x: x[0])
 
               with open(dst, 'w', newline='') as f2:
                   w = csv.writer(f2)
                   w.writerow(['date','eur_per_g'])
-                  w.writerows(rows)
+                  w.writerows(out)
 
           convert('raw_gold.csv','gold_history.csv')
           convert('raw_silver.csv','silver_history.csv')
           PY
+
+      - name: Mostra ultime righe (debug)
+        run: |
+          echo '--- gold_history.csv (tail) ---'
+          tail -n 5 gold_history.csv || true
+          echo '--- silver_history.csv (tail) ---'
+          tail -n 5 silver_history.csv || true
 
       - name: Commit & push se ci sono cambiamenti
         run: |
