@@ -1,5 +1,8 @@
 name: Sync Stooq CSV (to €/g) — robust
 
+permissions:
+  contents: write
+
 on:
   schedule:
     - cron: "10 * * * *"    # ogni ora al minuto 10 (UTC)
@@ -10,7 +13,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+  uses: actions/checkout@v4
+  with:
+    persist-credentials: true
+    fetch-depth: 0
+
 
       - name: Warm-up cookie su stooq.com
         run: |
