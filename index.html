@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
+  <title>Vetrina Oro & Argento</title>
+  <link rel="stylesheet" href="style.css"/>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+</head>
+<body>
+  <div id="rotator">
+    <div id="page">
+      <section id="top">
+        <div class="top-row logo-wrap">
+          <img id="logo" src="Senza nome copia.png" alt="Logo"/>
+        </div>
+        <div class="top-row qr-wrap">
+          <div id="qr"></div>
+        </div>
+      </section>
+
+      <section id="bottom">
+        <div class="cell"><h2>ultimi 15 giorni oro</h2><div id="gold_15d" class="chart"></div></div>
+        <div class="cell"><h2>ultimi 15 giorni argento</h2><div id="silver_15d" class="chart"></div></div>
+        <div class="cell"><h2>ultimi 6 mesi oro</h2><div id="gold_6m" class="chart"></div></div>
+        <div class="cell"><h2>ultimi 6 mesi argento</h2><div id="silver_6m" class="chart"></div></div>
+        <div class="cell"><h2>storico oro</h2><div id="gold_all" class="chart"></div></div>
+        <div class="cell"><h2>storico argento</h2><div id="silver_all" class="chart"></div></div>
+      </section>
+    </div>
+  </div>
+
+  <div id="error" hidden></div>
+
+  <script>
+    window.DASHBOARD_CONFIG = {
+      qrLink: "https://g.page/r/CXeq9Jkp56W3EBE/review",
+      goldCsv: "gold_history.csv",
+      silverCsv: "silver_history.csv",
+      refreshSeconds: 300
+    };
+  </script>
+  <script src="app.js"></script>
+</body>
+</html>
