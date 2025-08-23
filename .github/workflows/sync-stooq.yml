@@ -1,0 +1,82 @@
+name: Sync Stooq CSV (to €/g)
+
+on:
+  schedule:
+    - cron: "10 * * * *"   # ogni ora al minuto 10 (UTC). Cambia se vuoi.
+  workflow_dispatch:        # avvio manuale dal tab Actions
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Warm-up cookie su stooq.com
+        run: |
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+          curl -fsSL -A "$UA" -c cookies.txt https://stooq.com/ -o /dev/null
+
+      - name: Scarica GOLD XAU/EUR (daily)
+        run: |
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+          curl -fsSL -A "$UA" -b cookies.txt -c cookies.txt "https://stooq.com/q/d/l/?s=xaueur&i=d" -o raw_gold.csv
+          test -s raw_gold.csv
+
+      - name: Scarica SILVER XAG/EUR (daily)
+        run: |
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+          curl -fsSL -A "$UA" -b cookies.txt -c cookies.txt "https://stooq.com/q/d/l/?s=xageur&i=d" -o raw_silver.csv
+          test -s raw_silver.csv
+
+      - name: Converti da €/oz a €/g e mantieni solo date,eur_per_g
+        run: |
+          python - <<'PY'
+          import csv, sys
+          from decimal import Decimal, ROUND_HALF_UP
+
+          OZ_TO_G = Decimal('31.1035')
+
+          def convert(src, dst):
+              with open(src, newline='') as f:
+                  r = csv.DictReader(f)
+                  cols_lower = [c.lower() for c in r.fieldnames]
+                  # Trova colonne 'date' e 'close' (fallback all'ultima)
+                  date_field = ('date' if 'date' in cols_lower else r.fieldnames[0])
+                  if date_field != 'date':
+                      date_field = r.fieldnames[cols_lower.index('date')] if 'date' in cols_lower else r.fieldnames[0]
+                  price_field = None
+                  for cand in ('close','c','last','price'):
+                      if cand in cols_lower:
+                          price_field = r.fieldnames[cols_lower.index(cand)]
+                          break
+                  if price_field is None:
+                      price_field = r.fieldnames[-1]
+
+                  rows=[]
+                  for row in r:
+                      d = row[date_field].strip()
+                      if not d: 
+                          continue
+                      raw = row[price_field].strip().replace(',','.')
+                      if not raw:
+                          continue
+                      v = Decimal(raw)
+                      eur_per_g = (v / OZ_TO_G).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
+                      rows.append((d, eur_per_g))
+
+              with open(dst, 'w', newline='') as f2:
+                  w = csv.writer(f2)
+                  w.writerow(['date','eur_per_g'])
+                  w.writerows(rows)
+
+          convert('raw_gold.csv','gold_history.csv')
+          convert('raw_silver.csv','silver_history.csv')
+          PY
+
+      - name: Commit & push se ci sono cambiamenti
+        run: |
+          git config user.name  "csv-bot"
+          git config user.email "csv-bot@users.noreply.github.com"
+          git add gold_history.csv silver_history.csv || true
+          git diff --cached --quiet && echo "Nessun cambiamento" || (git commit -m "Auto update CSV $(date -u +%F' '%T'Z')" && git push)
