@@ -1,36 +1,17 @@
-const axios = require('axios');
-
-const GOLD_API_URL = 'https://www.goldapi.io/api/XAU/USD';
-const SILVER_API_URL = 'https://www.goldapi.io/api/XAG/USD';
-const API_TOKEN = 'YOUR_API_TOKEN'; // Replace with your GoldAPI token
-
-async function fetchGoldPrice() {
-    try {
-        const response = await axios.get(GOLD_API_URL, {
-            headers: { 'x-access-token': API_TOKEN }
-        });
-        return response.data;
-    } catch (error) {
-        console.error('Error fetching gold price:', error);
+async function fetchGoldData() {
+    const response = await fetch('https://www.goldapi.io/api/XAU/USD');
+    if (!response.ok) {
+        throw new Error('Failed to fetch gold data');
     }
+    const data = await response.json();
+    return data;
 }
 
-async function fetchSilverPrice() {
-    try {
-        const response = await axios.get(SILVER_API_URL, {
-            headers: { 'x-access-token': API_TOKEN }
-        });
-        return response.data;
-    } catch (error) {
-        console.error('Error fetching silver price:', error);
+async function fetchSilverData() {
+    const response = await fetch('https://www.goldapi.io/api/XAG/USD');
+    if (!response.ok) {
+        throw new Error('Failed to fetch silver data');
     }
+    const data = await response.json();
+    return data;
 }
-
-async function fetchPrices() {
-    const goldPrice = await fetchGoldPrice();
-    const silverPrice = await fetchSilverPrice();
-    console.log('Gold Price:', goldPrice);
-    console.log('Silver Price:', silverPrice);
-}
-
-fetchPrices();
