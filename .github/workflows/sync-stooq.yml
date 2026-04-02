@@ -21,36 +21,64 @@ jobs:
       - name: Warm-up cookie su stooq.com
         run: |
           set -euo pipefail
-          curl -fsSL -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" -c cookies.txt https://stooq.com/ -o /dev/null
+          curl -fsSL -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+            -H "Accept-Encoding: gzip, deflate" \
+            -H "Connection: keep-alive" \
+            -c cookies.txt https://stooq.com/ -o /dev/null
           echo "Cookie warmup completato"
 
-      - name: Scarica GOLD XAU/EUR (daily) con retry
+      - name: Scarica GOLD XAU/EUR (daily) con retry migliorato
         run: |
           set -euo pipefail
-          curl -fL --retry 5 --retry-delay 2 --retry-connrefused --compressed \
-            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" \
-            -b cookies.txt -c cookies.txt \
-            "https://stooq.com/q/d/l/?s=xaueur&i=d" -o raw_gold.csv
-          if [ -s raw_gold.csv ]; then
-            echo "Gold CSV scaricato:"
-            head -n 2 raw_gold.csv
-          else
-            echo "ERRORE: Gold CSV vuoto o non scaricato"
+          for attempt in {1..5}; do
+            echo "Tentativo $attempt/5 per GOLD..."
+            if curl -fL --max-time 30 --compressed \
+              -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              -H "Accept: text/csv" \
+              -H "Accept-Encoding: gzip, deflate" \
+              -H "Connection: keep-alive" \
+              -b cookies.txt -c cookies.txt \
+              "https://stooq.com/q/d/l/?s=xaueur&i=d" -o raw_gold.csv 2>/dev/null && \
+              [ -s raw_gold.csv ] && [ $(wc -l < raw_gold.csv) -gt 1 ]; then
+              echo "Gold CSV scaricato con successo"
+              head -n 2 raw_gold.csv
+              break
+            else
+              echo "Tentativo $attempt fallito"
+              [ $attempt -lt 5 ] && sleep 5
+            fi
+          done
+          
+          if [ ! -s raw_gold.csv ] || [ $(wc -l < raw_gold.csv) -le 1 ]; then
+            echo "ERRORE: Gold CSV vuoto o non scaricato dopo 5 tentativi"
             exit 1
           fi
 
-      - name: Scarica SILVER XAG/EUR (daily) con retry
+      - name: Scarica SILVER XAG/EUR (daily) con retry migliorato
         run: |
           set -euo pipefail
-          curl -fL --retry 5 --retry-delay 2 --retry-connrefused --compressed \
-            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" \
-            -b cookies.txt -c cookies.txt \
-            "https://stooq.com/q/d/l/?s=xageur&i=d" -o raw_silver.csv
-          if [ -s raw_silver.csv ]; then
-            echo "Silver CSV scaricato:"
-            head -n 2 raw_silver.csv
-          else
-            echo "ERRORE: Silver CSV vuoto o non scaricato"
+          for attempt in {1..5}; do
+            echo "Tentativo $attempt/5 per SILVER..."
+            if curl -fL --max-time 30 --compressed \
+              -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              -H "Accept: text/csv" \
+              -H "Accept-Encoding: gzip, deflate" \
+              -H "Connection: keep-alive" \
+              -b cookies.txt -c cookies.txt \
+              "https://stooq.com/q/d/l/?s=xageur&i=d" -o raw_silver.csv 2>/dev/null && \
+              [ -s raw_silver.csv ] && [ $(wc -l < raw_silver.csv) -gt 1 ]; then
+              echo "Silver CSV scaricato con successo"
+              head -n 2 raw_silver.csv
+              break
+            else
+              echo "Tentativo $attempt fallito"
+              [ $attempt -lt 5 ] && sleep 5
+            fi
+          done
+          
+          if [ ! -s raw_silver.csv ] || [ $(wc -l < raw_silver.csv) -le 1 ]; then
+            echo "ERRORE: Silver CSV vuoto o non scaricato dopo 5 tentativi"
             exit 1
           fi
 
@@ -137,3 +165,4 @@ jobs:
             git commit -m "Auto update CSV $(date -u +%F' '%T'Z')"
             git push
           fi
+        
