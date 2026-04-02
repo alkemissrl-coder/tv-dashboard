@@ -35,11 +35,9 @@ jobs:
         run: |
           python - <<'PY'
           import csv
-          import html
           import re
           import time
           import urllib.request
-          from datetime import datetime
           from decimal import Decimal, ROUND_HALF_UP
           from pathlib import Path
 
@@ -55,11 +53,6 @@ jobs:
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/123.0 Safari/537.36"
           )
-
-          MONTHS = {
-              "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
-              "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
-          }
 
           def fetch_text(url: str, retries: int = 4, base_delay: float = 2.0) -> str:
               last_error = None
@@ -88,14 +81,6 @@ jobs:
                           time.sleep(base_delay * attempt)
               raise RuntimeError(f"Download failed for {url}: {last_error}")
 
-          def strip_tags(text: str) -> str:
-              text = re.sub(r"<script\b[^>]*>.*?</script>", " ", text, flags=re.I | re.S)
-              text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
-              text = re.sub(r"<[^>]+>", " ", text)
-              text = html.unescape(text)
-              text = re.sub(r"\s+", " ", text).strip()
-              return text
-
           def parse_decimal(value: str) -> Decimal:
               value = value.strip()
               value = re.sub(r"[^0-9,.\-]", "", value)
@@ -112,45 +97,22 @@ jobs:
 
               return Decimal(value)
 
-          def parse_quote_date(date_text: str) -> str:
-              # es. "30 Mar"
-              m = re.fullmatch(r"(\d{1,2})\s+([A-Z][a-z]{2})", date_text.strip())
-              if not m:
-                  raise ValueError(f"invalid date text: {date_text}")
-              day = int(m.group(1))
-              month = MONTHS[m.group(2)]
-
-              now = datetime.utcnow()
-              year = now.year
-
-              # Se a inizio gennaio troviamo un mese futuro, assume anno precedente
-              if month > now.month + 1:
-                  year -= 1
-
-              return datetime(year, month, day).strftime("%Y-%m-%d")
-
-          def extract_quote(html_text: str, symbol: str) -> tuple[str, Decimal]:
-              text = strip_tags(html_text)
-
-              # Pattern tipico pubblico visto su Stooq:
-              # Gold (ozt) / Euro (XAUEUR). 30 Mar, 1:13 3898.17 -6.26 (-0.16%).
-              # Silver (ozt) / Euro (XAGEUR). 27 Mar, 22:00 60.6202 +1.3732 (+2.32%).
-              pattern = re.compile(
-                  rf"\({symbol}\)\.\s*(\d{{1,2}}\s+[A-Z][a-z]{{2}}),\s*\d{{1,2}}:\d{{2}}\s+(-?\d+(?:[.,]\d+)?)"
+          def extract_last_and_date(page_text: str, label: str):
+              # Cerca direttamente i campi Stooq:
+              # Last 3898.17 ; Date 2026-03-30
+              m = re.search(
+                  r"Last\s+(-?\d+(?:[.,]\d+)?)\s*;\s*Date\s+(\d{4}-\d{2}-\d{2})",
+                  page_text,
+                  flags=re.IGNORECASE | re.DOTALL,
               )
-
-              m = pattern.search(text)
               if not m:
-                  raise RuntimeError(f"{symbol}: quote pattern not found")
+                  raise RuntimeError(f"{label}: Last/Date pattern not found")
 
-              date_text = m.group(1)
-              value_text = m.group(2)
+              value = parse_decimal(m.group(1))
+              date_str = m.group(2)
+              return date_str, value
 
-              quote_date = parse_quote_date(date_text)
-              quote_value = parse_decimal(value_text)
-              return quote_date, quote_value
-
-          def read_local_csv(path: str) -> list[dict[str, str]]:
+          def read_local_csv(path: str):
               p = Path(path)
               if not p.exists():
                   return []
@@ -161,7 +123,7 @@ jobs:
                       raise RuntimeError(f"{path}: invalid CSV header")
               return rows
 
-          def write_local_csv(path: str, rows: list[dict[str, str]]) -> None:
+          def write_local_csv(path: str, rows):
               tmp = Path(path + ".tmp")
               with tmp.open("w", newline="", encoding="utf-8") as f:
                   writer = csv.DictWriter(f, fieldnames=["date", "eur_per_g"])
@@ -169,7 +131,7 @@ jobs:
                   writer.writerows(rows)
               tmp.replace(path)
 
-          def upsert_value(rows: list[dict[str, str]], date_str: str, value: Decimal) -> None:
+          def upsert_value(rows, date_str: str, value: Decimal):
               value_str = str(value)
               for row in rows:
                   if row["date"] == date_str:
@@ -184,8 +146,8 @@ jobs:
           gold_html = fetch_text(URLS["gold"])
           silver_html = fetch_text(URLS["silver"])
 
-          gold_date, gold_eur_per_oz = extract_quote(gold_html, "XAUEUR")
-          silver_date, silver_eur_per_oz = extract_quote(silver_html, "XAGEUR")
+          gold_date, gold_eur_per_oz = extract_last_and_date(gold_html, "XAUEUR")
+          silver_date, silver_eur_per_oz = extract_last_and_date(silver_html, "XAGEUR")
 
           gold_eur_per_g = (gold_eur_per_oz / OZ_TO_G).quantize(
               Decimal("0.0001"), rounding=ROUND_HALF_UP
@@ -196,7 +158,6 @@ jobs:
 
           print(f"Gold date: {gold_date}")
           print(f"Gold EUR/oz: {gold_eur_per_oz} -> EUR/g: {gold_eur_per_g}")
-
           print(f"Silver date: {silver_date}")
           print(f"Silver EUR/oz: {silver_eur_per_oz} -> EUR/g: {silver_eur_per_g}")
 
