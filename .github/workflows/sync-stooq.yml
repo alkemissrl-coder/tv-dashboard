@@ -18,133 +18,105 @@ jobs:
           persist-credentials: true
           fetch-depth: 0
 
-      - name: Warm-up cookie su stooq.com
-        run: |
-          set -euo pipefail
-          curl -fsSL -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
-            -H "Accept-Encoding: gzip, deflate" \
-            -H "Connection: keep-alive" \
-            -c cookies.txt https://stooq.com/ -o /dev/null
-          echo "Cookie warmup completato"
-
-      - name: Scarica GOLD XAU/EUR (daily) con retry migliorato
-        run: |
-          set -euo pipefail
-          for attempt in {1..5}; do
-            echo "Tentativo $attempt/5 per GOLD..."
-            if curl -fL --max-time 30 --compressed \
-              -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-              -H "Accept: text/csv" \
-              -H "Accept-Encoding: gzip, deflate" \
-              -H "Connection: keep-alive" \
-              -b cookies.txt -c cookies.txt \
-              "https://stooq.com/q/d/l/?s=xaueur&i=d" -o raw_gold.csv 2>/dev/null && \
-              [ -s raw_gold.csv ] && [ $(wc -l < raw_gold.csv) -gt 1 ]; then
-              echo "Gold CSV scaricato con successo"
-              head -n 2 raw_gold.csv
-              break
-            else
-              echo "Tentativo $attempt fallito"
-              [ $attempt -lt 5 ] && sleep 5
-            fi
-          done
-          
-          if [ ! -s raw_gold.csv ] || [ $(wc -l < raw_gold.csv) -le 1 ]; then
-            echo "ERRORE: Gold CSV vuoto o non scaricato dopo 5 tentativi"
-            exit 1
-          fi
-
-      - name: Scarica SILVER XAG/EUR (daily) con retry migliorato
-        run: |
-          set -euo pipefail
-          for attempt in {1..5}; do
-            echo "Tentativo $attempt/5 per SILVER..."
-            if curl -fL --max-time 30 --compressed \
-              -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-              -H "Accept: text/csv" \
-              -H "Accept-Encoding: gzip, deflate" \
-              -H "Connection: keep-alive" \
-              -b cookies.txt -c cookies.txt \
-              "https://stooq.com/q/d/l/?s=xageur&i=d" -o raw_silver.csv 2>/dev/null && \
-              [ -s raw_silver.csv ] && [ $(wc -l < raw_silver.csv) -gt 1 ]; then
-              echo "Silver CSV scaricato con successo"
-              head -n 2 raw_silver.csv
-              break
-            else
-              echo "Tentativo $attempt fallito"
-              [ $attempt -lt 5 ] && sleep 5
-            fi
-          done
-          
-          if [ ! -s raw_silver.csv ] || [ $(wc -l < raw_silver.csv) -le 1 ]; then
-            echo "ERRORE: Silver CSV vuoto o non scaricato dopo 5 tentativi"
-            exit 1
-          fi
-
-      - name: Converti €/oz in €/g e normalizza
+      - name: Scarica quotazioni da Stooq
         run: |
           python - <<'PY'
-          import csv, unicodedata
+          import requests
+          from bs4 import BeautifulSoup
+          import csv
+          from datetime import datetime
           from decimal import Decimal, ROUND_HALF_UP
 
           OZ_TO_G = Decimal('31.1035')
 
-          def norm(s:str)->str:
-              s = s.strip().lower()
-              s = unicodedata.normalize('NFKD', s)
-              return ''.join(ch for ch in s if not unicodedata.combining(ch))
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+          }
 
-          def convert(src, dst):
-              with open(src, 'r', encoding='utf-8-sig', newline='') as f:
-                  sample = f.read(2048); f.seek(0)
-                  try:
-                      dialect = csv.Sniffer().sniff(sample, delimiters=',;')
-                  except Exception:
-                      dialect = csv.excel
-                  reader = csv.reader(f, dialect)
-                  rows = [r for r in reader if any(cell.strip() for cell in r)]
-              if not rows:
-                  raise SystemExit(f"Nessun dato in {src}")
+          def estrai_valore(url, nome):
+              """Estrae il valore dalla pagina Stooq"""
+              try:
+                  response = requests.get(url, headers=headers, timeout=10)
+                  response.raise_for_status()
+                  soup = BeautifulSoup(response.content, 'html.parser')
+                  
+                  # Cerca il valore attuale della quotazione nella pagina
+                  span = soup.find('span', {'class': 'qquote_last'})
+                  if span:
+                      valore = Decimal(span.text.strip().replace(',', '.'))
+                      print(f"{nome}: {valore}")
+                      return valore
+                  else:
+                      print(f"ERRORE {nome}: span non trovato")
+                      return None
+              except Exception as e:
+                  print(f"ERRORE {nome}: {e}")
+                  return None
 
-              header = [h.lstrip('\ufeff') for h in rows[0]]
-              data_rows = rows[1:]
-              lower = [norm(h) for h in header]
+          # Estrai i valori da Stooq
+          tasso_usd_eur = estrai_valore('https://stooq.com/q/?s=usdeur', 'Tasso USD/EUR')
+          prezzo_oro_usd = estrai_valore('https://stooq.com/q/?s=xauusd', 'Oro USD/oz')
+          prezzo_argento_usd = estrai_valore('https://stooq.com/q/?s=xagusd&c=2y', 'Argento USD/oz')
 
-              date_idx = None
-              for cand in ('date','data'):
-                  if cand in lower:
-                      date_idx = lower.index(cand); break
-              if date_idx is None: date_idx = 0
+          if not (tasso_usd_eur and prezzo_oro_usd and prezzo_argento_usd):
+              raise SystemExit("Impossibile estrarre tutte le quotazioni")
 
-              close_idx = None
-              for cand in ('close','zamkniecie','c','last','price'):
-                  if cand in lower:
-                      close_idx = lower.index(cand); break
-              if close_idx is None: close_idx = len(header)-1
+          # Converti: USD/oz → EUR/oz → EUR/g
+          prezzo_oro_eur_per_g = (prezzo_oro_usd * tasso_usd_eur / OZ_TO_G).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
+          prezzo_argento_eur_per_g = (prezzo_argento_usd * tasso_usd_eur / OZ_TO_G).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
 
-              out=[]
-              for row in data_rows:
-                  if len(row) <= max(date_idx, close_idx): continue
-                  d = row[date_idx].strip()
-                  raw = row[close_idx].strip().replace(',', '.')
-                  if not d or not raw: continue
-                  try:
-                      v = Decimal(raw)
-                  except Exception:
-                      continue
-                  eur_per_g = (v / OZ_TO_G).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
-                  out.append((d, str(eur_per_g)))
+          data_odierna = datetime.utcnow().strftime('%Y-%m-%d')
+          print(f"\nConversioni:")
+          print(f"Oro: ${prezzo_oro_usd}/oz × {tasso_usd_eur} = €{prezzo_oro_eur_per_g}/g")
+          print(f"Argento: ${prezzo_argento_usd}/oz × {tasso_usd_eur} = €{prezzo_argento_eur_per_g}/g")
 
-              out.sort(key=lambda x: x[0])
+          # Leggi i dati storici esistenti
+          try:
+              with open('gold_history.csv', 'r', newline='') as f:
+                  reader = csv.DictReader(f)
+                  oro_storico = list(reader) if reader else []
+          except FileNotFoundError:
+              oro_storico = []
 
-              with open(dst, 'w', newline='') as f2:
-                  w = csv.writer(f2)
-                  w.writerow(['date','eur_per_g'])
-                  w.writerows(out)
+          try:
+              with open('silver_history.csv', 'r', newline='') as f:
+                  reader = csv.DictReader(f)
+                  argento_storico = list(reader) if reader else []
+          except FileNotFoundError:
+              argento_storico = []
 
-          convert('raw_gold.csv','gold_history.csv')
-          convert('raw_silver.csv','silver_history.csv')
+          # Aggiungi la nuova quotazione se non esiste già per oggi
+          oro_date_exist = any(row['date'] == data_odierna for row in oro_storico)
+          argento_date_exist = any(row['date'] == data_odierna for row in argento_storico)
+
+          if not oro_date_exist:
+              oro_storico.append({'date': data_odierna, 'eur_per_g': str(prezzo_oro_eur_per_g)})
+              print(f"✓ Aggiunto oro per {data_odierna}")
+          else:
+              print(f"✗ Oro già presente per {data_odierna}")
+
+          if not argento_date_exist:
+              argento_storico.append({'date': data_odierna, 'eur_per_g': str(prezzo_argento_eur_per_g)})
+              print(f"✓ Aggiunto argento per {data_odierna}")
+          else:
+              print(f"✗ Argento già presente per {data_odierna}")
+
+          # Ordina per data
+          oro_storico.sort(key=lambda x: x['date'])
+          argento_storico.sort(key=lambda x: x['date'])
+
+          # Scrivi i file
+          with open('gold_history.csv', 'w', newline='') as f:
+              writer = csv.DictWriter(f, fieldnames=['date', 'eur_per_g'])
+              writer.writeheader()
+              writer.writerows(oro_storico)
+
+          with open('silver_history.csv', 'w', newline='') as f:
+              writer = csv.DictWriter(f, fieldnames=['date', 'eur_per_g'])
+              writer.writeheader()
+              writer.writerows(argento_storico)
+
+          print("\n✓ File CSV aggiornati con successo")
           PY
 
       - name: Mostra ultime righe (debug)
@@ -165,4 +137,3 @@ jobs:
             git commit -m "Auto update CSV $(date -u +%F' '%T'Z')"
             git push
           fi
-        
