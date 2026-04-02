@@ -1,51 +1,32 @@
-name: Sync Metal CSV to EUR per gram
-
-permissions:
-  contents: write
+name: Debug Stooq Pages
 
 on:
-  schedule:
-    - cron: "20 23 * * *"   # ogni giorno alle 23:20 UTC
   workflow_dispatch:
 
-concurrency:
-  group: sync-metal-csv
-  cancel-in-progress: true
-
 jobs:
-  update:
+  debug:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      - name: Update gold and silver history
+      - name: Fetch and print Stooq HTML
         env:
           PYTHONUNBUFFERED: "1"
           TZ: UTC
         run: |
           python - <<'PY'
-          import csv
           import re
           import time
           import urllib.request
-          from decimal import Decimal, ROUND_HALF_UP
-          from pathlib import Path
-
-          OZ_TO_G = Decimal("31.1035")
 
           URLS = {
-              "gold": "https://stooq.com/q/?s=xaueur",
-              "silver": "https://stooq.com/q/?s=xageur",
+              "XAUEUR": "https://stooq.com/q/?s=xaueur",
+              "XAGEUR": "https://stooq.com/q/?s=xageur",
           }
 
           USER_AGENT = (
@@ -54,7 +35,7 @@ jobs:
               "Chrome/123.0 Safari/537.36"
           )
 
-          def fetch_text(url: str, retries: int = 4, base_delay: float = 2.0) -> str:
+          def fetch_text(url: str, retries: int = 5, base_delay: float = 2.0) -> str:
               last_error = None
               for attempt in range(1, retries + 1):
                   try:
@@ -62,7 +43,7 @@ jobs:
                           url,
                           headers={
                               "User-Agent": USER_AGENT,
-                              "Accept": "text/html,text/plain;q=0.9,*/*;q=0.8",
+                              "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
                               "Accept-Language": "en-US,en;q=0.9",
                               "Cache-Control": "no-cache",
                               "Pragma": "no-cache",
@@ -72,7 +53,7 @@ jobs:
                           if resp.status != 200:
                               raise RuntimeError(f"HTTP {resp.status}")
                           data = resp.read().decode("utf-8", errors="replace")
-                          if not data or not data.strip():
+                          if not data.strip():
                               raise RuntimeError("empty response")
                           return data
                   except Exception as e:
@@ -81,113 +62,38 @@ jobs:
                           time.sleep(base_delay * attempt)
               raise RuntimeError(f"Download failed for {url}: {last_error}")
 
-          def parse_decimal(value: str) -> Decimal:
-              value = value.strip()
-              value = re.sub(r"[^0-9,.\-]", "", value)
-              if not value:
-                  raise ValueError("empty numeric value")
+          def print_debug(label: str, html_text: str) -> None:
+              print(f"\n{'=' * 80}")
+              print(f"{label} - HTML LENGTH: {len(html_text)}")
+              print(f"{'=' * 80}")
 
-              if "," in value and "." in value:
-                  if value.rfind(".") > value.rfind(","):
-                      value = value.replace(",", "")
-                  else:
-                      value = value.replace(".", "").replace(",", ".")
-              else:
-                  value = value.replace(",", ".")
+              print(f"\n--- {label} RAW HTML START (first 5000 chars) ---")
+              print(html_text[:5000])
 
-              return Decimal(value)
+              print(f"\n--- {label} RAW HTML END (last 3000 chars) ---")
+              print(html_text[-3000:])
 
-          def extract_last_and_date(page_text: str, label: str):
-              # Cerca direttamente i campi Stooq:
-              # Last 3898.17 ; Date 2026-03-30
-              m = re.search(
-                  r"Last\s+(-?\d+(?:[.,]\d+)?)\s*;\s*Date\s+(\d{4}-\d{2}-\d{2})",
-                  page_text,
-                  flags=re.IGNORECASE | re.DOTALL,
-              )
-              if not m:
-                  raise RuntimeError(f"{label}: Last/Date pattern not found")
+              low = html_text.lower()
 
-              value = parse_decimal(m.group(1))
-              date_str = m.group(2)
-              return date_str, value
+              for needle in ["last", "date", "xaueur", "xageur", "qquote", "meta", "description"]:
+                  idx = low.find(needle)
+                  print(f"\n--- {label} SEARCH: {needle!r} -> index {idx} ---")
+                  if idx != -1:
+                      start = max(0, idx - 300)
+                      end = min(len(html_text), idx + 700)
+                      print(html_text[start:end])
 
-          def read_local_csv(path: str):
-              p = Path(path)
-              if not p.exists():
-                  return []
-              with p.open("r", newline="", encoding="utf-8") as f:
-                  rows = list(csv.DictReader(f))
-              for row in rows:
-                  if "date" not in row or "eur_per_g" not in row:
-                      raise RuntimeError(f"{path}: invalid CSV header")
-              return rows
+              metas = re.findall(r"<meta[^>]+>", html_text, flags=re.I | re.S)
+              print(f"\n--- {label} META TAG COUNT: {len(metas)} ---")
+              for i, meta in enumerate(metas[:30], 1):
+                  print(f"[META {i}] {meta}")
 
-          def write_local_csv(path: str, rows):
-              tmp = Path(path + ".tmp")
-              with tmp.open("w", newline="", encoding="utf-8") as f:
-                  writer = csv.DictWriter(f, fieldnames=["date", "eur_per_g"])
-                  writer.writeheader()
-                  writer.writerows(rows)
-              tmp.replace(path)
+              title_match = re.search(r"<title[^>]*>(.*?)</title>", html_text, flags=re.I | re.S)
+              print(f"\n--- {label} TITLE ---")
+              print(title_match.group(1) if title_match else "NO TITLE FOUND")
 
-          def upsert_value(rows, date_str: str, value: Decimal):
-              value_str = str(value)
-              for row in rows:
-                  if row["date"] == date_str:
-                      row["eur_per_g"] = value_str
-                      break
-              else:
-                  rows.append({"date": date_str, "eur_per_g": value_str})
-              rows.sort(key=lambda r: r["date"])
-
-          print("Downloading data from Stooq...")
-
-          gold_html = fetch_text(URLS["gold"])
-          silver_html = fetch_text(URLS["silver"])
-
-          gold_date, gold_eur_per_oz = extract_last_and_date(gold_html, "XAUEUR")
-          silver_date, silver_eur_per_oz = extract_last_and_date(silver_html, "XAGEUR")
-
-          gold_eur_per_g = (gold_eur_per_oz / OZ_TO_G).quantize(
-              Decimal("0.0001"), rounding=ROUND_HALF_UP
-          )
-          silver_eur_per_g = (silver_eur_per_oz / OZ_TO_G).quantize(
-              Decimal("0.0001"), rounding=ROUND_HALF_UP
-          )
-
-          print(f"Gold date: {gold_date}")
-          print(f"Gold EUR/oz: {gold_eur_per_oz} -> EUR/g: {gold_eur_per_g}")
-          print(f"Silver date: {silver_date}")
-          print(f"Silver EUR/oz: {silver_eur_per_oz} -> EUR/g: {silver_eur_per_g}")
-
-          gold_rows = read_local_csv("gold_history.csv")
-          silver_rows = read_local_csv("silver_history.csv")
-
-          upsert_value(gold_rows, gold_date, gold_eur_per_g)
-          upsert_value(silver_rows, silver_date, silver_eur_per_g)
-
-          write_local_csv("gold_history.csv", gold_rows)
-          write_local_csv("silver_history.csv", silver_rows)
-
-          print("CSV updated successfully.")
+          for label, url in URLS.items():
+              print(f"\nFetching {label}: {url}")
+              html_text = fetch_text(url)
+              print_debug(label, html_text)
           PY
-
-      - name: Show latest rows
-        run: |
-          echo '--- gold_history.csv ---'
-          tail -n 5 gold_history.csv || true
-          echo '--- silver_history.csv ---'
-          tail -n 5 silver_history.csv || true
-
-      - name: Commit and push if changed
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add gold_history.csv silver_history.csv
-          if git diff --cached --quiet; then
-            echo "No changes"
-          else
-            git commit -m "Auto update CSV $(date -u +%F' '%T'Z')"
-            git push
-          fi
