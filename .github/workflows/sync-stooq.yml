@@ -35,25 +35,19 @@ jobs:
         run: |
           python - <<'PY'
           import csv
-          import html as html_lib
-          import io
+          import html
           import re
           import time
           import urllib.request
           from datetime import datetime
-          from decimal import Decimal, ROUND_HALF_UP, getcontext
+          from decimal import Decimal, ROUND_HALF_UP
           from pathlib import Path
 
-          getcontext().prec = 28
           OZ_TO_G = Decimal("31.1035")
 
           URLS = {
-              "eurusd_csv": "https://stooq.com/q/d/l/?s=eurusd&i=d",
-              "xauusd_csv": "https://stooq.com/q/d/l/?s=xauusd&i=d",
-              "xagusd_csv": "https://stooq.com/q/d/l/?s=xagusd&i=d",
-              "eurusd_html": "https://stooq.com/q/d/?s=eurusd",
-              "xauusd_html": "https://stooq.com/q/d/?s=xauusd",
-              "xagusd_html": "https://stooq.com/q/d/?s=xagusd",
+              "gold": "https://stooq.com/q/?s=xaueur",
+              "silver": "https://stooq.com/q/?s=xageur",
           }
 
           USER_AGENT = (
@@ -75,7 +69,7 @@ jobs:
                           url,
                           headers={
                               "User-Agent": USER_AGENT,
-                              "Accept": "text/csv,text/html,text/plain;q=0.9,*/*;q=0.8",
+                              "Accept": "text/html,text/plain;q=0.9,*/*;q=0.8",
                               "Accept-Language": "en-US,en;q=0.9",
                               "Cache-Control": "no-cache",
                               "Pragma": "no-cache",
@@ -94,6 +88,14 @@ jobs:
                           time.sleep(base_delay * attempt)
               raise RuntimeError(f"Download failed for {url}: {last_error}")
 
+          def strip_tags(text: str) -> str:
+              text = re.sub(r"<script\b[^>]*>.*?</script>", " ", text, flags=re.I | re.S)
+              text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
+              text = re.sub(r"<[^>]+>", " ", text)
+              text = html.unescape(text)
+              text = re.sub(r"\s+", " ", text).strip()
+              return text
+
           def parse_decimal(value: str) -> Decimal:
               value = value.strip()
               value = re.sub(r"[^0-9,.\-]", "", value)
@@ -110,86 +112,43 @@ jobs:
 
               return Decimal(value)
 
-          def parse_stooq_text_date(s: str) -> str:
-              s = s.strip()
-              m = re.fullmatch(r"(\d{1,2})\s+([A-Z][a-z]{2})\s+(\d{4})", s)
+          def parse_quote_date(date_text: str) -> str:
+              # es. "30 Mar"
+              m = re.fullmatch(r"(\d{1,2})\s+([A-Z][a-z]{2})", date_text.strip())
               if not m:
-                  raise ValueError(f"invalid Stooq date: {s}")
+                  raise ValueError(f"invalid date text: {date_text}")
               day = int(m.group(1))
-              mon = MONTHS[m.group(2)]
-              year = int(m.group(3))
-              return datetime(year, mon, day).strftime("%Y-%m-%d")
+              month = MONTHS[m.group(2)]
 
-          def strip_tags(text: str) -> str:
-              text = re.sub(r"<script\b[^>]*>.*?</script>", " ", text, flags=re.I | re.S)
-              text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
-              text = re.sub(r"<[^>]+>", " ", text)
-              text = html_lib.unescape(text)
-              text = re.sub(r"\s+", " ", text).strip()
-              return text
+              now = datetime.utcnow()
+              year = now.year
 
-          def load_series_from_csv(csv_text: str, label: str) -> dict[str, Decimal]:
-              reader = csv.DictReader(io.StringIO(csv_text))
-              required = {"Date", "Close"}
-              if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
-                  raise RuntimeError(f"{label}: CSV format unexpected: {reader.fieldnames}")
+              # Se a inizio gennaio troviamo un mese futuro, assume anno precedente
+              if month > now.month + 1:
+                  year -= 1
 
-              out: dict[str, Decimal] = {}
-              for row in reader:
-                  date_str = (row.get("Date") or "").strip()
-                  close_str = (row.get("Close") or "").strip()
-                  if not date_str or not close_str:
-                      continue
-                  try:
-                      out[date_str] = parse_decimal(close_str)
-                  except Exception:
-                      continue
+              return datetime(year, month, day).strftime("%Y-%m-%d")
 
-              if not out:
-                  raise RuntimeError(f"{label}: no valid rows in CSV")
-              return out
-
-          def load_series_from_html(html_text: str, label: str) -> dict[str, Decimal]:
+          def extract_quote(html_text: str, symbol: str) -> tuple[str, Decimal]:
               text = strip_tags(html_text)
 
-              # Esempio atteso nel testo:
-              # Historical values of EURUSD ; 14117, 23 Feb 2026, 1.17943 ; 14116, 20 Feb 2026, 1.17716 ; ...
+              # Pattern tipico pubblico visto su Stooq:
+              # Gold (ozt) / Euro (XAUEUR). 30 Mar, 1:13 3898.17 -6.26 (-0.16%).
+              # Silver (ozt) / Euro (XAGEUR). 27 Mar, 22:00 60.6202 +1.3732 (+2.32%).
               pattern = re.compile(
-                  r"(\d+)\s*,\s*(\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4})\s*,\s*(-?\d+(?:[.,]\d+)?)"
+                  rf"\({symbol}\)\.\s*(\d{{1,2}}\s+[A-Z][a-z]{{2}}),\s*\d{{1,2}}:\d{{2}}\s+(-?\d+(?:[.,]\d+)?)"
               )
 
-              out: dict[str, Decimal] = {}
-              for _, date_txt, value_txt in pattern.findall(text):
-                  try:
-                      date_str = parse_stooq_text_date(date_txt)
-                      out[date_str] = parse_decimal(value_txt)
-                  except Exception:
-                      continue
+              m = pattern.search(text)
+              if not m:
+                  raise RuntimeError(f"{symbol}: quote pattern not found")
 
-              if not out:
-                  raise RuntimeError(f"{label}: no valid rows in HTML historical text")
-              return out
+              date_text = m.group(1)
+              value_text = m.group(2)
 
-          def load_series_with_fallback(csv_url: str, html_url: str, label: str) -> dict[str, Decimal]:
-              try:
-                  text = fetch_text(csv_url)
-                  series = load_series_from_csv(text, label)
-                  print(f"{label}: loaded from CSV")
-                  return series
-              except Exception as e:
-                  print(f"{label}: CSV failed -> {e}")
-                  html_text = fetch_text(html_url)
-                  series = load_series_from_html(html_text, label)
-                  print(f"{label}: loaded from HTML fallback")
-                  return series
-
-          def latest_common_date(*series_dicts: dict[str, Decimal]) -> str:
-              common = set(series_dicts[0].keys())
-              for s in series_dicts[1:]:
-                  common &= set(s.keys())
-              if not common:
-                  raise RuntimeError("No common date across series")
-              return max(common)
+              quote_date = parse_quote_date(date_text)
+              quote_value = parse_decimal(value_text)
+              return quote_date, quote_value
 
           def read_local_csv(path: str) -> list[dict[str, str]]:
               p = Path(path)
@@ -222,35 +181,30 @@ jobs:
 
           print("Downloading data from Stooq...")
 
-          eurusd = load_series_with_fallback(URLS["eurusd_csv"], URLS["eurusd_html"], "EURUSD")
-          gold = load_series_with_fallback(URLS["xauusd_csv"], URLS["xauusd_html"], "XAUUSD")
-          silver = load_series_with_fallback(URLS["xagusd_csv"], URLS["xagusd_html"], "XAGUSD")
+          gold_html = fetch_text(URLS["gold"])
+          silver_html = fetch_text(URLS["silver"])
 
-          quote_date = latest_common_date(eurusd, gold, silver)
+          gold_date, gold_eur_per_oz = extract_quote(gold_html, "XAUEUR")
+          silver_date, silver_eur_per_oz = extract_quote(silver_html, "XAGEUR")
 
-          eur_usd = eurusd[quote_date]
-          usd_eur = Decimal("1") / eur_usd
-
-          gold_usd_oz = gold[quote_date]
-          silver_usd_oz = silver[quote_date]
-
-          gold_eur_g = (gold_usd_oz * usd_eur / OZ_TO_G).quantize(
+          gold_eur_per_g = (gold_eur_per_oz / OZ_TO_G).quantize(
               Decimal("0.0001"), rounding=ROUND_HALF_UP
           )
-          silver_eur_g = (silver_usd_oz * usd_eur / OZ_TO_G).quantize(
+          silver_eur_per_g = (silver_eur_per_oz / OZ_TO_G).quantize(
               Decimal("0.0001"), rounding=ROUND_HALF_UP
           )
 
-          print(f"Date: {quote_date}")
-          print(f"EUR/USD: {eur_usd} -> USD/EUR: {usd_eur}")
-          print(f"Gold EUR/g: {gold_eur_g}")
-          print(f"Silver EUR/g: {silver_eur_g}")
+          print(f"Gold date: {gold_date}")
+          print(f"Gold EUR/oz: {gold_eur_per_oz} -> EUR/g: {gold_eur_per_g}")
+
+          print(f"Silver date: {silver_date}")
+          print(f"Silver EUR/oz: {silver_eur_per_oz} -> EUR/g: {silver_eur_per_g}")
 
           gold_rows = read_local_csv("gold_history.csv")
           silver_rows = read_local_csv("silver_history.csv")
 
-          upsert_value(gold_rows, quote_date, gold_eur_g)
-          upsert_value(silver_rows, quote_date, silver_eur_g)
+          upsert_value(gold_rows, gold_date, gold_eur_per_g)
+          upsert_value(silver_rows, silver_date, silver_eur_per_g)
 
           write_local_csv("gold_history.csv", gold_rows)
           write_local_csv("silver_history.csv", silver_rows)
