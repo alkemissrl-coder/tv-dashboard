@@ -1,148 +1,179 @@
-name: "Sync Stooq CSV to EUR/g"
+name: Sync Stooq CSV to EUR/g
 
 permissions:
   contents: write
 
 on:
   schedule:
-    - cron: "10 * * * *"   # ogni ora al minuto 10 (UTC)
+    - cron: "15 23 * * *"   # 23:15 UTC, una volta al giorno
   workflow_dispatch:
+
+concurrency:
+  group: sync-stooq-csv
+  cancel-in-progress: true
 
 jobs:
   update:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v6
         with:
-          persist-credentials: true
           fetch-depth: 0
 
-      - name: Install Python dependencies
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install playwright
+          playwright install --with-deps chromium
 
-      - name: Install Playwright browsers
-        run: playwright install chromium
-
-      - name: Scarica quotazioni da Stooq
+      - name: Download quotes from Stooq and update CSV
         run: |
           python - <<'PY'
           import asyncio
-          from playwright.async_api import async_playwright
           import csv
-          from datetime import datetime
+          import re
           from decimal import Decimal, ROUND_HALF_UP
+          from pathlib import Path
+          from playwright.async_api import async_playwright
 
-          OZ_TO_G = Decimal('31.1035')
+          OZ_TO_G = Decimal("31.1035")
 
-          async def estrai_valore(url, nome):
-              """Estrae il valore dalla pagina Stooq usando Playwright"""
-              try:
-                  async with async_playwright() as p:
-                      browser = await p.chromium.launch()
-                      page = await browser.new_page()
-                      await page.goto(url, wait_until='networkidle')
-                      
-                      # Attendi lo span con la quotazione
-                      await page.wait_for_selector('span.qquote_last', timeout=5000)
-                      valore_text = await page.text_content('span.qquote_last')
-                      
-                      await browser.close()
-                      
-                      if valore_text:
-                          valore = Decimal(valore_text.strip().replace(',', '.'))
-                          print(f"{nome}: {valore}")
-                          return valore
-                      else:
-                          print(f"ERRORE {nome}: testo vuoto")
-                          return None
-              except Exception as e:
-                  print(f"ERRORE {nome}: {e}")
-                  return None
+          URLS = {
+              "usd_eur": "https://stooq.com/q/?s=usdeur",
+              "gold": "https://stooq.com/q/?s=xauusd",
+              "silver": "https://stooq.com/q/?s=xagusd",
+          }
+
+          def parse_decimal(text: str) -> Decimal:
+              text = text.strip()
+
+              # tiene solo numeri, virgole, punti, segno meno
+              cleaned = re.sub(r"[^0-9,.\-]", "", text)
+
+              # gestisce casi tipo 1,234.56
+              if "," in cleaned and "." in cleaned:
+                  if cleaned.rfind(".") > cleaned.rfind(","):
+                      cleaned = cleaned.replace(",", "")
+                  else:
+                      cleaned = cleaned.replace(".", "").replace(",", ".")
+              else:
+                  cleaned = cleaned.replace(",", ".")
+
+              return Decimal(cleaned)
+
+          def extract_last_and_date(body_text: str, label: str):
+              # cerca "Last ... Date YYYY-MM-DD"
+              m = re.search(
+                  r"Last\s+([^\n]+?)\s*Date\s+(\d{4}-\d{2}-\d{2})",
+                  body_text,
+                  re.IGNORECASE | re.DOTALL,
+              )
+              if not m:
+                  raise ValueError(f"{label}: impossibile trovare Last/Date nella pagina")
+
+              raw_last = m.group(1)
+              quote_date = m.group(2)
+
+              value = parse_decimal(raw_last)
+              return value, quote_date
+
+          async def fetch_quote(page, url: str, label: str):
+              await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+              await page.wait_for_timeout(2000)
+
+              body = await page.locator("body").inner_text()
+              value, quote_date = extract_last_and_date(body, label)
+
+              print(f"{label}: {value} @ {quote_date}")
+              return value, quote_date
+
+          def read_csv(path: str):
+              p = Path(path)
+              if not p.exists():
+                  return []
+              with p.open("r", newline="", encoding="utf-8") as f:
+                  return list(csv.DictReader(f))
+
+          def write_csv(path: str, rows):
+              with open(path, "w", newline="", encoding="utf-8") as f:
+                  writer = csv.DictWriter(f, fieldnames=["date", "eur_per_g"])
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def upsert_daily_row(rows, date_str: str, value: Decimal):
+              value_str = str(value)
+              found = False
+              for row in rows:
+                  if row["date"] == date_str:
+                      row["eur_per_g"] = value_str
+                      found = True
+                      break
+              if not found:
+                  rows.append({"date": date_str, "eur_per_g": value_str})
+              rows.sort(key=lambda x: x["date"])
 
           async def main():
-              # Estrai i valori da Stooq
-              tasso_usd_eur = await estrai_valore('https://stooq.com/q/?s=usdeur', 'Tasso USD/EUR')
-              prezzo_oro_usd = await estrai_valore('https://stooq.com/q/?s=xauusd', 'Oro USD/oz')
-              prezzo_argento_usd = await estrai_valore('https://stooq.com/q/?s=xagusd&c=2y', 'Argento USD/oz')
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True)
+                  page = await browser.new_page()
 
-              if not (tasso_usd_eur and prezzo_oro_usd and prezzo_argento_usd):
-                  raise SystemExit("Impossibile estrarre tutte le quotazioni")
+                  usd_eur, fx_date = await fetch_quote(page, URLS["usd_eur"], "USD/EUR")
+                  gold_usd_oz, gold_date = await fetch_quote(page, URLS["gold"], "Gold USD/oz")
+                  silver_usd_oz, silver_date = await fetch_quote(page, URLS["silver"], "Silver USD/oz")
 
-              # Converti: USD/oz → EUR/oz → EUR/g
-              prezzo_oro_eur_per_g = (prezzo_oro_usd * tasso_usd_eur / OZ_TO_G).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
-              prezzo_argento_eur_per_g = (prezzo_argento_usd * tasso_usd_eur / OZ_TO_G).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
+                  await browser.close()
 
-              data_odierna = datetime.utcnow().strftime('%Y-%m-%d')
-              print(f"\nConversioni:")
-              print(f"Oro: ${prezzo_oro_usd}/oz × {tasso_usd_eur} = €{prezzo_oro_eur_per_g}/g")
-              print(f"Argento: ${prezzo_argento_usd}/oz × {tasso_usd_eur} = €{prezzo_argento_eur_per_g}/g")
+              # usa la data della quotazione metallo; se differisce da FX, fallisce in modo esplicito
+              if len({fx_date, gold_date, silver_date}) != 1:
+                  raise SystemExit(
+                      f"Date non allineate: FX={fx_date}, GOLD={gold_date}, SILVER={silver_date}"
+                  )
 
-              # Leggi i dati storici esistenti
-              try:
-                  with open('gold_history.csv', 'r', newline='') as f:
-                      reader = csv.DictReader(f)
-                      oro_storico = list(reader) if reader else []
-              except FileNotFoundError:
-                  oro_storico = []
+              quote_date = gold_date
 
-              try:
-                  with open('silver_history.csv', 'r', newline='') as f:
-                      reader = csv.DictReader(f)
-                      argento_storico = list(reader) if reader else []
-              except FileNotFoundError:
-                  argento_storico = []
+              gold_eur_g = (gold_usd_oz * usd_eur / OZ_TO_G).quantize(
+                  Decimal("0.0001"), rounding=ROUND_HALF_UP
+              )
+              silver_eur_g = (silver_usd_oz * usd_eur / OZ_TO_G).quantize(
+                  Decimal("0.0001"), rounding=ROUND_HALF_UP
+              )
 
-              # Aggiungi la nuova quotazione se non esiste già per oggi
-              oro_date_exist = any(row['date'] == data_odierna for row in oro_storico)
-              argento_date_exist = any(row['date'] == data_odierna for row in argento_storico)
+              print(f"Gold EUR/g: {gold_eur_g}")
+              print(f"Silver EUR/g: {silver_eur_g}")
 
-              if not oro_date_exist:
-                  oro_storico.append({'date': data_odierna, 'eur_per_g': str(prezzo_oro_eur_per_g)})
-                  print(f"✓ Aggiunto oro per {data_odierna}")
-              else:
-                  print(f"✗ Oro già presente per {data_odierna}")
+              gold_rows = read_csv("gold_history.csv")
+              silver_rows = read_csv("silver_history.csv")
 
-              if not argento_date_exist:
-                  argento_storico.append({'date': data_odierna, 'eur_per_g': str(prezzo_argento_eur_per_g)})
-                  print(f"✓ Aggiunto argento per {data_odierna}")
-              else:
-                  print(f"✗ Argento già presente per {data_odierna}")
+              upsert_daily_row(gold_rows, quote_date, gold_eur_g)
+              upsert_daily_row(silver_rows, quote_date, silver_eur_g)
 
-              # Ordina per data
-              oro_storico.sort(key=lambda x: x['date'])
-              argento_storico.sort(key=lambda x: x['date'])
+              write_csv("gold_history.csv", gold_rows)
+              write_csv("silver_history.csv", silver_rows)
 
-              # Scrivi i file
-              with open('gold_history.csv', 'w', newline='') as f:
-                  writer = csv.DictWriter(f, fieldnames=['date', 'eur_per_g'])
-                  writer.writeheader()
-                  writer.writerows(oro_storico)
-
-              with open('silver_history.csv', 'w', newline='') as f:
-                  writer = csv.DictWriter(f, fieldnames=['date', 'eur_per_g'])
-                  writer.writeheader()
-                  writer.writerows(argento_storico)
-
-              print("\n✓ File CSV aggiornati con successo")
+              print("CSV aggiornati correttamente")
 
           asyncio.run(main())
           PY
 
-      - name: Mostra ultime righe (debug)
+      - name: Show tail for debug
         run: |
           echo '--- gold_history.csv ---'
           tail -n 5 gold_history.csv || true
           echo '--- silver_history.csv ---'
           tail -n 5 silver_history.csv || true
 
-      - name: Commit & push se ci sono cambiamenti
+      - name: Commit and push if changed
         run: |
-          git config user.name  "csv-bot"
-          git config user.email "csv-bot@users.noreply.github.com"
-          git add gold_history.csv silver_history.csv || true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add gold_history.csv silver_history.csv
           if git diff --cached --quiet; then
             echo "Nessun cambiamento"
           else
