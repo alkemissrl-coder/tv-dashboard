@@ -40,6 +40,7 @@ jobs:
           import re
           import time
           import urllib.request
+          from datetime import datetime
           from decimal import Decimal, ROUND_HALF_UP, getcontext
           from pathlib import Path
 
@@ -50,7 +51,6 @@ jobs:
               "eurusd_csv": "https://stooq.com/q/d/l/?s=eurusd&i=d",
               "xauusd_csv": "https://stooq.com/q/d/l/?s=xauusd&i=d",
               "xagusd_csv": "https://stooq.com/q/d/l/?s=xagusd&i=d",
-
               "eurusd_html": "https://stooq.com/q/d/?s=eurusd",
               "xauusd_html": "https://stooq.com/q/d/?s=xauusd",
               "xagusd_html": "https://stooq.com/q/d/?s=xagusd",
@@ -61,6 +61,11 @@ jobs:
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/123.0 Safari/537.36"
           )
+
+          MONTHS = {
+              "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+              "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+          }
 
           def fetch_text(url: str, retries: int = 4, base_delay: float = 2.0) -> str:
               last_error = None
@@ -105,7 +110,19 @@ jobs:
 
               return Decimal(value)
 
+          def parse_stooq_text_date(s: str) -> str:
+              s = s.strip()
+              m = re.fullmatch(r"(\d{1,2})\s+([A-Z][a-z]{2})\s+(\d{4})", s)
+              if not m:
+                  raise ValueError(f"invalid Stooq date: {s}")
+              day = int(m.group(1))
+              mon = MONTHS[m.group(2)]
+              year = int(m.group(3))
+              return datetime(year, mon, day).strftime("%Y-%m-%d")
+
           def strip_tags(text: str) -> str:
+              text = re.sub(r"<script\b[^>]*>.*?</script>", " ", text, flags=re.I | re.S)
+              text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
               text = re.sub(r"<[^>]+>", " ", text)
               text = html_lib.unescape(text)
               text = re.sub(r"\s+", " ", text).strip()
@@ -133,36 +150,24 @@ jobs:
               return out
 
           def load_series_from_html(html_text: str, label: str) -> dict[str, Decimal]:
+              text = strip_tags(html_text)
+
+              # Esempio atteso nel testo:
+              # Historical values of EURUSD ; 14117, 23 Feb 2026, 1.17943 ; 14116, 20 Feb 2026, 1.17716 ; ...
+              pattern = re.compile(
+                  r"(\d+)\s*,\s*(\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4})\s*,\s*(-?\d+(?:[.,]\d+)?)"
+              )
+
               out: dict[str, Decimal] = {}
-
-              rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html_text, flags=re.I | re.S)
-              for row_html in rows:
-                  cells_html = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row_html, flags=re.I | re.S)
-                  if not cells_html:
+              for _, date_txt, value_txt in pattern.findall(text):
+                  try:
+                      date_str = parse_stooq_text_date(date_txt)
+                      out[date_str] = parse_decimal(value_txt)
+                  except Exception:
                       continue
-
-                  cells = [strip_tags(c) for c in cells_html]
-                  if not cells:
-                      continue
-
-                  date_str = None
-                  nums = []
-
-                  for cell in cells:
-                      cell = cell.strip()
-                      if re.fullmatch(r"\d{4}-\d{2}-\d{2}", cell):
-                          date_str = cell
-                      else:
-                          try:
-                              nums.append(parse_decimal(cell))
-                          except Exception:
-                              pass
-
-                  if date_str and nums:
-                      out[date_str] = nums[-1]
 
               if not out:
-                  raise RuntimeError(f"{label}: no valid rows in HTML table")
+                  raise RuntimeError(f"{label}: no valid rows in HTML historical text")
               return out
 
           def load_series_with_fallback(csv_url: str, html_url: str, label: str) -> dict[str, Decimal]:
