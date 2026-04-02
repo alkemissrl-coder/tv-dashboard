@@ -21,13 +21,13 @@ jobs:
       - name: Warm-up cookie su stooq.com
         run: |
           set -euo pipefail
-          Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
           curl -fsSL -A "$UA" -c cookies.txt https://stooq.com/ -o /dev/null
 
       - name: Scarica GOLD XAU/EUR (daily) con retry
         run: |
           set -euo pipefail
-          Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
           curl -fL --retry 5 --retry-delay 2 --retry-connrefused --compressed \
             -A "$UA" -b cookies.txt -c cookies.txt \
             "https://stooq.com/q/d/l/?s=xaueur&i=d" -o raw_gold.csv
@@ -37,7 +37,7 @@ jobs:
       - name: Scarica SILVER XAG/EUR (daily) con retry
         run: |
           set -euo pipefail
-          Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
           curl -fL --retry 5 --retry-delay 2 --retry-connrefused --compressed \
             -A "$UA" -b cookies.txt -c cookies.txt \
             "https://stooq.com/q/d/l/?s=xageur&i=d" -o raw_silver.csv
