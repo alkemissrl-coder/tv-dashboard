@@ -54,7 +54,6 @@ jobs:
           OZ_TO_G = Decimal("31.1035")
 
           def fetch_metal_prices(retries: int = 3) -> dict:
-              """Fetch gold and silver prices from Metal Price API."""
               params = {
                   "api_key": API_KEY,
                   "base": "EUR",
@@ -68,11 +67,11 @@ jobs:
                       data = resp.json()
                       
                       if not data.get("success"):
-                          raise RuntimeError(f"API returned success=false: {data}")
+                          raise RuntimeError(f"API returned success=false")
                       
                       rates = data.get("rates", {})
                       if "EURXAU" not in rates or "EURXAG" not in rates:
-                          raise RuntimeError(f"Missing EURXAU or EURXAG in rates: {rates}")
+                          raise RuntimeError(f"Missing EURXAU or EURXAG in rates")
                       
                       return rates
                       
@@ -85,23 +84,17 @@ jobs:
               raise RuntimeError(f"Failed to fetch prices after {retries} attempts")
 
           def parse_decimal(value) -> Decimal:
-              """Convert number to Decimal."""
               return Decimal(str(value))
 
           def read_local_csv(path: str):
-              """Read CSV file, return list of rows."""
               p = Path(path)
               if not p.exists():
                   return []
               with p.open("r", newline="", encoding="utf-8") as f:
                   rows = list(csv.DictReader(f))
-              for row in rows:
-                  if "date" not in row or "eur_per_g" not in row:
-                      raise RuntimeError(f"{path}: invalid CSV header")
               return rows
 
           def write_local_csv(path: str, rows):
-              """Write CSV file."""
               tmp = Path(path + ".tmp")
               with tmp.open("w", newline="", encoding="utf-8") as f:
                   writer = csv.DictWriter(f, fieldnames=["date", "eur_per_g"])
@@ -110,7 +103,6 @@ jobs:
               tmp.replace(path)
 
           def upsert_value(rows, date_str: str, value: Decimal):
-              """Add or update value for date."""
               value_str = str(value)
               for row in rows:
                   if row["date"] == date_str:
@@ -123,61 +115,24 @@ jobs:
           
           try:
               rates = fetch_metal_prices()
-              
-              # EURXAU and EURXAG are EUR per troy ounce
               gold_eur_per_oz = parse_decimal(rates["EURXAU"])
               silver_eur_per_oz = parse_decimal(rates["EURXAG"])
-              
           except Exception as e:
               print(f"ERROR: {e}")
               raise SystemExit(1)
 
-          # Convert to EUR per gram
-          gold_eur_per_g = (gold_eur_per_oz / OZ_TO_G).quantize(
-              Decimal("0.0001"), rounding=ROUND_HALF_UP
-          )
-          silver_eur_per_g = (silver_eur_per_oz / OZ_TO_G).quantize(
-              Decimal("0.0001"), rounding=ROUND_HALF_UP
-          )
+          gold_eur_per_g = (gold_eur_per_oz / OZ_TO_G).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+          silver_eur_per_g = (silver_eur_per_oz / OZ_TO_G).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
-          # Use current UTC time for timestamp (date only)
           date_str = datetime.utcnow().strftime("%Y-%m-%d")
           
           print(f"Date: {date_str}")
           print(f"Gold: {gold_eur_per_oz} EUR/oz → {gold_eur_per_g} EUR/g")
           print(f"Silver: {silver_eur_per_oz} EUR/oz → {silver_eur_per_g} EUR/g")
 
-          # Read existing data
           gold_rows = read_local_csv("gold_history.csv")
           silver_rows = read_local_csv("silver_history.csv")
 
-          # Update with new values
           upsert_value(gold_rows, date_str, gold_eur_per_g)
-          upsert_value(silver_rows, date_str, silver_eur_per_g)
-
-          # Write back to files
-          write_local_csv("gold_history.csv", gold_rows)
-          write_local_csv("silver_history.csv", silver_rows)
-
-          print("✅ CSV files updated successfully!")
-          PY
-
-      - name: Show latest rows
-        run: |
-          echo '--- gold_history.csv (last 5 rows) ---'
-          tail -n 5 gold_history.csv || true
-          echo ''
-          echo '--- silver_history.csv (last 5 rows) ---'
-          tail -n 5 silver_history.csv || true
-
-      - name: Commit and push if changed
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add gold_history.csv silver_history.csv
-          if git diff --cached --quiet; then
-            echo "ℹ️  No changes to commit"
-          else
-            git commit -m "Auto update metal prices $(date -u +%F' '%T'Z')"
-            git push
-          fi
+          upsert_value(silver_rows, date_str, silver_eur_per_g)*
+
