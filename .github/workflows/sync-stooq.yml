@@ -1,139 +1,338 @@
-name: Sync Metal Prices from Metal Price API
+name: Sync Metal Prices
 
 permissions:
   contents: write
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    # Ogni 30 minuti, ai minuti 7 e 37
+    - cron: "7,37 * * * *"
   workflow_dispatch:
 
 concurrency:
-  group: sync-metal-csv
+  group: sync-metal-prices
   cancel-in-progress: true
 
 jobs:
-  update:
+  sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install requests
-
-      - name: Update gold and silver history
-        env:
-          PYTHONUNBUFFERED: "1"
-          TZ: UTC
-          API_KEY: ${{ secrets.METAL_PRICE_API_KEY }}
         run: |
-          python3 << 'EOF'
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Check API fetch
+        env:
+          API_KEY: ${{ secrets.METAL_PRICE_API_KEY }}
+          PYTHONUNBUFFERED: "1"
+          TZ: "UTC"
+        run: |
+          python << 'PYTHON_SCRIPT'
+          import os
+          import sys
+          import requests
+
+          API_KEY = os.environ.get("API_KEY")
+          BASE_URL = "https://api.metalpriceapi.com/v1/latest"
+
+          if not API_KEY:
+              print("ERROR: METAL_PRICE_API_KEY secret is missing or empty.", file=sys.stderr)
+              sys.exit(1)
+
+          params = {
+              "api_key": API_KEY,
+              "base": "EUR",
+              "currencies": "XAU,XAG",
+          }
+
+          print("Testing Metal Price API fetch...")
+          response = requests.get(BASE_URL, params=params, timeout=20)
+
+          print(f"HTTP status: {response.status_code}")
+
+          if response.status_code != 200:
+              print("API response body:")
+              print(response.text[:1000])
+              response.raise_for_status()
+
+          data = response.json()
+
+          if not data.get("success"):
+              print("API response body:")
+              print(data)
+              raise RuntimeError("Metal Price API returned success=false.")
+
+          rates = data.get("rates")
+
+          if not isinstance(rates, dict):
+              print("API response body:")
+              print(data)
+              raise RuntimeError("API response does not contain a valid rates object.")
+
+          print("Available rate keys:", ", ".join(sorted(rates.keys())))
+
+          has_gold = "EURXAU" in rates or "XAU" in rates
+          has_silver = "EURXAG" in rates or "XAG" in rates
+
+          if not has_gold:
+              raise RuntimeError("Gold rate not found. Expected EURXAU or XAU.")
+
+          if not has_silver:
+              raise RuntimeError("Silver rate not found. Expected EURXAG or XAG.")
+
+          print("API fetch test completed successfully.")
+          PYTHON_SCRIPT
+
+      - name: Update gold_history.csv and silver_history.csv
+        env:
+          API_KEY: ${{ secrets.METAL_PRICE_API_KEY }}
+          PYTHONUNBUFFERED: "1"
+          TZ: "UTC"
+        run: |
+          python << 'PYTHON_SCRIPT'
           import csv
           import os
-          from datetime import datetime
-          from decimal import Decimal, ROUND_HALF_UP
+          import sys
+          from datetime import datetime, timezone
+          from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
           from pathlib import Path
+
           import requests
-          
+
+
           API_KEY = os.environ.get("API_KEY")
-          if not API_KEY:
-              print("ERROR: API_KEY not set!")
-              exit(1)
-          
           BASE_URL = "https://api.metalpriceapi.com/v1/latest"
+
+          GOLD_CSV = Path("gold_history.csv")
+          SILVER_CSV = Path("silver_history.csv")
+
           OZ_TO_G = Decimal("31.1035")
-          
-          def fetch_metal_prices():
+          CSV_FIELDS = ["date", "eur_per_g"]
+
+
+          def fail(message):
+              print(f"ERROR: {message}", file=sys.stderr)
+              sys.exit(1)
+
+
+          def to_decimal(value, label):
+              try:
+                  return Decimal(str(value))
+              except (InvalidOperation, TypeError):
+                  fail(f"Invalid decimal value for {label}: {value!r}")
+
+
+          def fetch_rates():
+              if not API_KEY:
+                  fail("METAL_PRICE_API_KEY secret is missing or empty.")
+
               params = {
                   "api_key": API_KEY,
                   "base": "EUR",
-                  "currencies": "XAU,XAG"
+                  "currencies": "XAU,XAG",
               }
-              resp = requests.get(BASE_URL, params=params, timeout=10)
-              resp.raise_for_status()
-              data = resp.json()
+
+              print("Calling Metal Price API...")
+              response = requests.get(BASE_URL, params=params, timeout=20)
+
+              print(f"HTTP status: {response.status_code}")
+
+              if response.status_code != 200:
+                  print("API response body:")
+                  print(response.text[:1000])
+                  response.raise_for_status()
+
+              data = response.json()
+
               if not data.get("success"):
-                  raise RuntimeError("API returned success=false")
-              rates = data.get("rates", {})
-              if "EURXAU" not in rates or "EURXAG" not in rates:
-                  raise RuntimeError("Missing EURXAU or EURXAG")
+                  print("API response body:")
+                  print(data)
+                  fail("Metal Price API returned success=false.")
+
+              rates = data.get("rates")
+              if not isinstance(rates, dict):
+                  print("API response body:")
+                  print(data)
+                  fail("API response does not contain a valid rates object.")
+
+              print("Available rate keys:", ", ".join(sorted(rates.keys())))
+
               return rates
-          
+
+
+          def get_eur_per_oz(rates, metal_code):
+              direct_key = f"EUR{metal_code}"
+
+              if direct_key in rates:
+                  value = to_decimal(rates[direct_key], direct_key)
+                  print(f"Using {direct_key} as EUR per oz: {value}")
+                  return value
+
+              if metal_code in rates:
+                  value = to_decimal(rates[metal_code], metal_code)
+
+                  if value == 0:
+                      fail(f"{metal_code} rate is zero, cannot invert.")
+
+                  eur_per_oz = Decimal("1") / value
+                  print(f"Using {metal_code} as {metal_code} per EUR: {value}")
+                  print(f"Converted to EUR per oz: {eur_per_oz}")
+
+                  return eur_per_oz
+
+              fail(f"Missing rate for {metal_code}. Expected {direct_key} or {metal_code}.")
+
+
+          def eur_per_gram(eur_per_oz):
+              return (eur_per_oz / OZ_TO_G).quantize(
+                  Decimal("0.0001"),
+                  rounding=ROUND_HALF_UP,
+              )
+
+
           def read_csv(path):
-              p = Path(path)
-              if not p.exists():
+              if not path.exists():
+                  print(f"{path} does not exist. It will be created.")
                   return []
-              with p.open("r", encoding="utf-8") as f:
-                  return list(csv.DictReader(f))
-          
+
+              with path.open("r", encoding="utf-8", newline="") as file:
+                  reader = csv.DictReader(file)
+
+                  if reader.fieldnames != CSV_FIELDS:
+                      fail(
+                          f"{path} has wrong columns: {reader.fieldnames}. "
+                          f"Expected exactly: {CSV_FIELDS}"
+                      )
+
+                  rows = []
+                  for row in reader:
+                      date_value = (row.get("date") or "").strip()
+                      price_value = (row.get("eur_per_g") or "").strip()
+
+                      if not date_value or not price_value:
+                          continue
+
+                      rows.append({
+                          "date": date_value,
+                          "eur_per_g": price_value,
+                      })
+
+                  return rows
+
+
+          def upsert_today(rows, today, value):
+              value_str = str(value)
+
+              for row in rows:
+                  if row["date"] == today:
+                      old_value = row["eur_per_g"]
+                      row["eur_per_g"] = value_str
+
+                      if old_value == value_str:
+                          print(f"{today}: unchanged at {value_str}")
+                      else:
+                          print(f"{today}: updated {old_value} -> {value_str}")
+
+                      return rows
+
+              rows.append({
+                  "date": today,
+                  "eur_per_g": value_str,
+              })
+
+              print(f"{today}: added new row {value_str}")
+
+              return rows
+
+
+          def sort_rows(rows):
+              return sorted(rows, key=lambda row: row["date"])
+
+
           def write_csv(path, rows):
-              with open(path, "w", newline="", encoding="utf-8") as f:
-                  writer = csv.DictWriter(f, fieldnames=["date", "eur_per_g"])
+              with path.open("w", encoding="utf-8", newline="") as file:
+                  writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
                   writer.writeheader()
                   writer.writerows(rows)
-          
-          def upsert_value(rows, date_str, value):
-              value_str = str(value)
-              for row in rows:
-                  if row["date"] == date_str:
-                      row["eur_per_g"] = value_str
-                      return
-              rows.append({"date": date_str, "eur_per_g": value_str})
-              rows.sort(key=lambda r: r["date"])
-          
-          print("Fetching Metal Price API data...")
-          rates = fetch_metal_prices()
-          
-          gold_eur_per_oz = Decimal(str(rates["EURXAU"]))
-          silver_eur_per_oz = Decimal(str(rates["EURXAG"]))
-          
-          gold_eur_per_g = (gold_eur_per_oz / OZ_TO_G).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-          silver_eur_per_g = (silver_eur_per_oz / OZ_TO_G).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-          
-          date_str = datetime.utcnow().strftime("%Y-%m-%d")
-          
-          print(f"Date: {date_str}")
-          print(f"Gold: {gold_eur_per_oz} EUR/oz -> {gold_eur_per_g} EUR/g")
-          print(f"Silver: {silver_eur_per_oz} EUR/oz -> {silver_eur_per_g} EUR/g")
-          
-          gold_rows = read_csv("gold_history.csv")
-          silver_rows = read_csv("silver_history.csv")
-          
-          upsert_value(gold_rows, date_str, gold_eur_per_g)
-          upsert_value(silver_rows, date_str, silver_eur_per_g)
-          
-          write_csv("gold_history.csv", gold_rows)
-          write_csv("silver_history.csv", silver_rows)
-          
-          print("CSV updated successfully!")
-          EOF
+
+
+          def main():
+              rates = fetch_rates()
+
+              gold_eur_per_oz = get_eur_per_oz(rates, "XAU")
+              silver_eur_per_oz = get_eur_per_oz(rates, "XAG")
+
+              gold_eur_per_g = eur_per_gram(gold_eur_per_oz)
+              silver_eur_per_g = eur_per_gram(silver_eur_per_oz)
+
+              today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+              print(f"Date UTC: {today}")
+              print(f"Gold EUR/oz: {gold_eur_per_oz}")
+              print(f"Gold EUR/g: {gold_eur_per_g}")
+              print(f"Silver EUR/oz: {silver_eur_per_oz}")
+              print(f"Silver EUR/g: {silver_eur_per_g}")
+
+              gold_rows = read_csv(GOLD_CSV)
+              silver_rows = read_csv(SILVER_CSV)
+
+              print(f"Existing gold rows: {len(gold_rows)}")
+              print(f"Existing silver rows: {len(silver_rows)}")
+
+              gold_rows = upsert_today(gold_rows, today, gold_eur_per_g)
+              silver_rows = upsert_today(silver_rows, today, silver_eur_per_g)
+
+              gold_rows = sort_rows(gold_rows)
+              silver_rows = sort_rows(silver_rows)
+
+              write_csv(GOLD_CSV, gold_rows)
+              write_csv(SILVER_CSV, silver_rows)
+
+              print("CSV files updated successfully.")
+
+
+          if __name__ == "__main__":
+              main()
+          PYTHON_SCRIPT
 
       - name: Show latest rows
         run: |
-          echo "gold_history.csv (last 5 rows):"
-          tail -n 5 gold_history.csv || true
+          echo "gold_history.csv latest rows:"
+          tail -n 10 gold_history.csv || true
+
           echo ""
-          echo "silver_history.csv (last 5 rows):"
-          tail -n 5 silver_history.csv || true
+          echo "silver_history.csv latest rows:"
+          tail -n 10 silver_history.csv || true
 
       - name: Commit and push if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo "Git status before add:"
+          git status --short
+
           git add gold_history.csv silver_history.csv
+
+          echo "Staged diff:"
+          git diff --cached -- gold_history.csv silver_history.csv || true
+
           if git diff --cached --quiet; then
-            echo "No changes"
+            echo "No CSV changes to commit."
           else
-            git commit -m "Auto update metal prices"
+            git commit -m "Update metal price history"
             git push
           fi
